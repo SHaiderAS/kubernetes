@@ -199,14 +199,13 @@ var _ = SIGDescribe("Secrets", func() {
 	})
 
 	/*
-				Release: v1.9
-				Testname: Immutable secret, creation, deletion, recreation
-				Description:
-		To test the behavior of immutable secrets, first create an immutable secret, then deploy a pod that consumes this secret. Afterward, delete the original secret and recreate it with the same name but with new data values. Next, create a second pod that consumes this newly recreated immutable secret. Ideally, the second pod should reflect the updated data from the new immutable secret. This process helps confirm whether the newly created pod accurately consumes the latest secret data.
+		Release: v1.9
+		Testname: Immutable secret, creation, deletion, recreation
+		Description: To test the behavior of immutable secrets, first create an immutable secret, then deploy a pod that consumes this secret. Afterward, delete the original secret and recreate it with the same name but with new data values. Next, create a second pod that consumes this newly recreated immutable secret. Ideally, the second pod should reflect the updated data from the new immutable secret. This process helps confirm whether the newly created pod accurately consumes the latest secret data.
 	*/
 
 	// this test case is a little flaky as it relays on time and depending on this pod2 output differs sometimes.
-	framework.ConformanceIt("our custom test", f.WithNodeConformance(), func(ctx context.Context) {
+	framework.ConformanceIt("Delected secrets should not stay in cache", f.WithNodeConformance(), func(ctx context.Context) {
 		podLogTimeout := e2epod.GetPodSecretUpdateTimeout(ctx, f.ClientSet)
 		containerTimeoutArg := fmt.Sprintf("--retry_time=%v", int(podLogTimeout.Seconds()))
 		trueVal := true
@@ -338,6 +337,38 @@ var _ = SIGDescribe("Secrets", func() {
 
 		gomega.Eventually(ctx, pod2Logs, podLogTimeout, framework.Poll).Should(gomega.ContainSubstring("value-7"))
 
+	})
+
+	/*
+		Release: v1.9
+		Testname: Immutable secret, create, update
+		Description: Create an immutable secret, then attempt to update it, which should result in an error.
+	*/
+	framework.ConformanceIt("immutable secret should not get updated", f.WithNodeConformance(), func(ctx context.Context) {
+		secretName := "s-test-opt-create-" + string(uuid.NewUUID())
+		immutableSecret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace.Name,
+				Name:      secretName,
+			},
+			Data: map[string][]byte{
+				"data-1": []byte("value-1"),
+			},
+			Immutable: ptr.To(true),
+		}
+
+		ginkgo.By(fmt.Sprintf("Creating secret with name %s", immutableSecret.Name))
+		var err error
+		if immutableSecret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(ctx, immutableSecret, metav1.CreateOptions{}); err != nil {
+			framework.Failf("unable to create test secret %s: %v", immutableSecret.Name, err)
+		}
+
+		ginkgo.By(fmt.Sprintf("Updating secret %v", immutableSecret.Name))
+		immutableSecret.ResourceVersion = "" // to force update
+		delete(immutableSecret.Data, "data-1")
+		immutableSecret.Data["data-3"] = []byte("value-3")
+		_, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Update(ctx, immutableSecret, metav1.UpdateOptions{})
+		framework.Gomega().Expect(err).To(gomega.HaveOccurred())
 	})
 
 	/*
