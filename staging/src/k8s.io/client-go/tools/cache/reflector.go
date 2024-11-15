@@ -53,6 +53,9 @@ var (
 	// We try to spread the load on apiserver by setting timeouts for
 	// watch requests - it is random in [minWatchTimeout, 2*minWatchTimeout].
 	defaultMinWatchTimeout = 5 * time.Minute
+
+	// creating a global immutable bool variables as it requires mininmal changes in the code base
+	immutable = false
 )
 
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
@@ -312,6 +315,20 @@ var internalPackages = []string{"client-go/tools/cache/"}
 func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
 	wait.BackoffUntil(func() {
+		if err := r.ListAndWatch(stopCh); err != nil {
+			r.watchErrorHandler(r, err)
+		}
+	}, r.backoffManager, true, stopCh)
+	klog.V(3).Infof("Stopping reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
+}
+
+// Run repeatedly uses the reflector's ListAndWatch to fetch all the
+// objects and subsequent deltas.
+// Run will exit when stopCh is closed.
+func (r *Reflector) ImmutableObjectRun(stopCh <-chan struct{}) {
+	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
+	wait.BackoffUntil(func() {
+		immutable = true
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
 		}
@@ -836,9 +853,11 @@ loop:
 					utilruntime.HandleError(fmt.Errorf("%s: unable to add watch event object (%#v) to store: %v", name, event.Object, err))
 				}
 			case watch.Modified:
-				err := store.Update(event.Object)
-				if err != nil {
-					utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", name, event.Object, err))
+				if !immutable {
+					err := store.Update(event.Object)
+					if err != nil {
+						utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", name, event.Object, err))
+					}
 				}
 			case watch.Deleted:
 				// TODO: Will any consumers need access to the "last known
