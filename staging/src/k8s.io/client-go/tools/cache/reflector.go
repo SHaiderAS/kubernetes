@@ -53,9 +53,6 @@ var (
 	// We try to spread the load on apiserver by setting timeouts for
 	// watch requests - it is random in [minWatchTimeout, 2*minWatchTimeout].
 	defaultMinWatchTimeout = 5 * time.Minute
-
-	// creating a global immutable bool variables as it requires mininmal changes in the code base
-	immutable = false
 )
 
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
@@ -122,6 +119,8 @@ type Reflector struct {
 	//
 	// TODO(#115478): Consider making reflector.UseWatchList a private field. Since we implemented "api streaming" on the etcd storage layer it should work.
 	UseWatchList *bool
+	//immutable tells if the object sent is immutable or not
+	immutable bool
 }
 
 func (r *Reflector) Name() string {
@@ -315,6 +314,7 @@ var internalPackages = []string{"client-go/tools/cache/"}
 func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
 	wait.BackoffUntil(func() {
+		r.immutable = false
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
 		}
@@ -322,13 +322,13 @@ func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Stopping reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
 }
 
-// Run repeatedly uses the reflector's ListAndWatch to fetch all the
+// ImmutableObjectRun repeatedly uses the reflector's ListAndWatch to fetch all the
 // objects and subsequent deltas.
-// Run will exit when stopCh is closed.
+// ImmutableObjectRun will exit when stopCh is closed.
 func (r *Reflector) ImmutableObjectRun(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
 	wait.BackoffUntil(func() {
-		immutable = true
+		r.immutable = true
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
 		}
@@ -481,7 +481,7 @@ func (r *Reflector) watch(w watch.Interface, stopCh <-chan struct{}, resyncerrc 
 		}
 
 		err = handleWatch(start, w, r.store, r.expectedType, r.expectedGVK, r.name, r.typeDescription, r.setLastSyncResourceVersion,
-			r.clock, resyncerrc, stopCh)
+			r.clock, resyncerrc, stopCh, r.immutable)
 		// Ensure that watch will not be reused across iterations.
 		w.Stop()
 		w = nil
@@ -700,7 +700,7 @@ func (r *Reflector) watchList(stopCh <-chan struct{}) (watch.Interface, error) {
 		}
 		watchListBookmarkReceived, err := handleListWatch(start, w, temporaryStore, r.expectedType, r.expectedGVK, r.name, r.typeDescription,
 			func(rv string) { resourceVersion = rv },
-			r.clock, make(chan error), stopCh)
+			r.clock, make(chan error), stopCh, r.immutable)
 		if err != nil {
 			w.Stop() // stop and retry with clean state
 			if errors.Is(err, errorStopRequested) {
@@ -758,11 +758,11 @@ func handleListWatch(
 	setLastSyncResourceVersion func(string),
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) (bool, error) {
 	exitOnWatchListBookmarkReceived := true
 	return handleAnyWatch(start, w, store, expectedType, expectedGVK, name, expectedTypeName,
-		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh)
+		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh, immutable)
 }
 
 // handleListWatch consumes events from w, updates the Store, and records the
@@ -779,11 +779,11 @@ func handleWatch(
 	setLastSyncResourceVersion func(string),
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) error {
 	exitOnWatchListBookmarkReceived := false
 	_, err := handleAnyWatch(start, w, store, expectedType, expectedGVK, name, expectedTypeName,
-		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh)
+		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh, immutable)
 	return err
 }
 
@@ -807,7 +807,7 @@ func handleAnyWatch(start time.Time,
 	exitOnWatchListBookmarkReceived bool,
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) (bool, error) {
 	watchListBookmarkReceived := false
 	eventCount := 0
