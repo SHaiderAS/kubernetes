@@ -109,7 +109,7 @@ func (i *objectCacheItem) stopIfIdle(now time.Time, maxIdleTime time.Duration) b
 func (i *objectCacheItem) restartReflectorIfNeeded() {
 	i.lock.Lock()
 	defer i.lock.Unlock()
-	if i.immutable || !i.stopped {
+	if !i.stopped {
 		return
 	}
 	i.stopCh = make(chan struct{})
@@ -121,7 +121,11 @@ func (i *objectCacheItem) startReflector() {
 	i.waitGroup.Wait()
 	i.waitGroup.Add(1)
 	defer i.waitGroup.Done()
-	i.reflector.Run(i.stopCh)
+	if i.immutable {
+		i.reflector.ImmutableObjectRun(i.stopCh)
+	} else {
+		i.reflector.Run(i.stopCh)
+	}
 }
 
 // cacheStore is in order to rewrite Replace function to mark initialized flag
@@ -330,22 +334,6 @@ func (c *objectCache) Get(namespace, name string) (runtime.Object, error) {
 		return nil, apierrors.NewNotFound(c.groupResource, name)
 	}
 	if object, ok := obj.(runtime.Object); ok {
-		// If the returned object is immutable, stop the reflector.
-		//
-		// NOTE: we may potentially not even start the reflector if the object is
-		// already immutable. However, given that:
-		// - we want to also handle the case when object is marked as immutable later
-		// - Secrets and ConfigMaps are periodically fetched by volumemanager anyway
-		// - doing that wouldn't provide visible scalability/performance gain - we
-		//   already have it from here
-		// - doing that would require significant refactoring to reflector
-		// we limit ourselves to just quickly stop the reflector here.
-		if c.isImmutable(object) {
-			item.setImmutable()
-			if item.stop() {
-				klog.V(4).InfoS("Stopped watching for changes - object is immutable", "obj", klog.KRef(namespace, name))
-			}
-		}
 		return object, nil
 	}
 	return nil, fmt.Errorf("unexpected object type: %v", obj)

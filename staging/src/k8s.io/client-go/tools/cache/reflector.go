@@ -119,6 +119,8 @@ type Reflector struct {
 	//
 	// TODO(#115478): Consider making reflector.UseWatchList a private field. Since we implemented "api streaming" on the etcd storage layer it should work.
 	UseWatchList *bool
+	//immutable tells if the object sent is immutable or not
+	immutable bool
 }
 
 func (r *Reflector) Name() string {
@@ -312,6 +314,21 @@ var internalPackages = []string{"client-go/tools/cache/"}
 func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
 	wait.BackoffUntil(func() {
+		r.immutable = false
+		if err := r.ListAndWatch(stopCh); err != nil {
+			r.watchErrorHandler(r, err)
+		}
+	}, r.backoffManager, true, stopCh)
+	klog.V(3).Infof("Stopping reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
+}
+
+// ImmutableObjectRun repeatedly uses the reflector's ListAndWatch to fetch all the
+// objects and subsequent deltas.
+// ImmutableObjectRun will exit when stopCh is closed.
+func (r *Reflector) ImmutableObjectRun(stopCh <-chan struct{}) {
+	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.typeDescription, r.resyncPeriod, r.name)
+	wait.BackoffUntil(func() {
+		r.immutable = true
 		if err := r.ListAndWatch(stopCh); err != nil {
 			r.watchErrorHandler(r, err)
 		}
@@ -464,7 +481,7 @@ func (r *Reflector) watch(w watch.Interface, stopCh <-chan struct{}, resyncerrc 
 		}
 
 		err = handleWatch(start, w, r.store, r.expectedType, r.expectedGVK, r.name, r.typeDescription, r.setLastSyncResourceVersion,
-			r.clock, resyncerrc, stopCh)
+			r.clock, resyncerrc, stopCh, r.immutable)
 		// Ensure that watch will not be reused across iterations.
 		w.Stop()
 		w = nil
@@ -683,7 +700,7 @@ func (r *Reflector) watchList(stopCh <-chan struct{}) (watch.Interface, error) {
 		}
 		watchListBookmarkReceived, err := handleListWatch(start, w, temporaryStore, r.expectedType, r.expectedGVK, r.name, r.typeDescription,
 			func(rv string) { resourceVersion = rv },
-			r.clock, make(chan error), stopCh)
+			r.clock, make(chan error), stopCh, r.immutable)
 		if err != nil {
 			w.Stop() // stop and retry with clean state
 			if errors.Is(err, errorStopRequested) {
@@ -741,11 +758,11 @@ func handleListWatch(
 	setLastSyncResourceVersion func(string),
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) (bool, error) {
 	exitOnWatchListBookmarkReceived := true
 	return handleAnyWatch(start, w, store, expectedType, expectedGVK, name, expectedTypeName,
-		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh)
+		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh, immutable)
 }
 
 // handleListWatch consumes events from w, updates the Store, and records the
@@ -762,11 +779,11 @@ func handleWatch(
 	setLastSyncResourceVersion func(string),
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) error {
 	exitOnWatchListBookmarkReceived := false
 	_, err := handleAnyWatch(start, w, store, expectedType, expectedGVK, name, expectedTypeName,
-		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh)
+		setLastSyncResourceVersion, exitOnWatchListBookmarkReceived, clock, errCh, stopCh, immutable)
 	return err
 }
 
@@ -790,7 +807,7 @@ func handleAnyWatch(start time.Time,
 	exitOnWatchListBookmarkReceived bool,
 	clock clock.Clock,
 	errCh chan error,
-	stopCh <-chan struct{},
+	stopCh <-chan struct{}, immutable bool,
 ) (bool, error) {
 	watchListBookmarkReceived := false
 	eventCount := 0
@@ -836,9 +853,11 @@ loop:
 					utilruntime.HandleError(fmt.Errorf("%s: unable to add watch event object (%#v) to store: %v", name, event.Object, err))
 				}
 			case watch.Modified:
-				err := store.Update(event.Object)
-				if err != nil {
-					utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", name, event.Object, err))
+				if !immutable {
+					err := store.Update(event.Object)
+					if err != nil {
+						utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", name, event.Object, err))
+					}
 				}
 			case watch.Deleted:
 				// TODO: Will any consumers need access to the "last known

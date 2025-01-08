@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/nodefeature"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 )
 
 var _ = SIGDescribe("ConfigMap", func() {
@@ -231,6 +232,182 @@ var _ = SIGDescribe("ConfigMap", func() {
 		gomega.Eventually(ctx, pollLogs1, podLogTimeout, framework.Poll).Should(gomega.ContainSubstring("value-1"))
 		ginkgo.By("Waiting for pod with binary data")
 		gomega.Eventually(ctx, pollLogs2, podLogTimeout, framework.Poll).Should(gomega.ContainSubstring("de ca fe ba d0 fe ff"))
+	})
+
+	/*
+		Release: v1.9
+		Testname: Immutable configMap, creation, deletion, recreation
+		Description: To test the behavior of immutable configMaps, first create an immutable confiMap, then deploy a pod that consumes this configMap. Afterward, delete the original configMap and recreate it with the same name but with new data values. Next, create a second pod that consumes this newly recreated immutable configMap. Ideally, the second pod should reflect the updated data from the new immutable config map. This process helps confirm whether the newly created pod accurately consumes the latest configMap data.
+	*/
+
+	// this test case is a little flaky as it relays on time and depending on this pod2 output differs sometimes.
+	framework.ConformanceIt("Delected configMaps should not stay in cache", f.WithNodeConformance(), func(ctx context.Context) {
+		podLogTimeout := e2epod.GetPodSecretUpdateTimeout(ctx, f.ClientSet)
+		containerTimeoutArg := fmt.Sprintf("--retry_time=%v", int(podLogTimeout.Seconds()))
+		trueVal := true
+		volumeMountPath := "/etc/configmap-volumes"
+
+		configMapName := "s-test-opt-create-" + string(uuid.NewUUID())
+		immutableContainerName := "creates-volume-test"
+		immutableVolumeName := "creates-volume"
+		immutableConfigMap := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace.Name,
+				Name:      configMapName,
+			},
+			Data: map[string]string{
+				"data-1": "value-1",
+			},
+			Immutable: ptr.To(true),
+		}
+
+		newImmutableConfigMap := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace.Name,
+				Name:      configMapName,
+			},
+			Data: map[string]string{
+				"data-1": "value-7",
+			},
+			Immutable: ptr.To(true),
+		}
+
+		ginkgo.By(fmt.Sprintf("Creating configmap with name %s", immutableConfigMap.Name))
+		var err error
+		if immutableConfigMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, immutableConfigMap, metav1.CreateOptions{}); err != nil {
+			framework.Failf("unable to create configMap %s: %v", immutableConfigMap.Name, err)
+		}
+
+		pod1 := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pod-configmaps-" + string(uuid.NewUUID()),
+			},
+			Spec: v1.PodSpec{
+				Volumes: []v1.Volume{
+					{
+						Name: immutableVolumeName,
+						VolumeSource: v1.VolumeSource{
+							ConfigMap: &v1.ConfigMapVolumeSource{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: configMapName,
+								},
+								Optional: &trueVal,
+							},
+						},
+					},
+				},
+				Containers: []v1.Container{
+					{
+						Name:  immutableContainerName,
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
+						Args:  []string{"mounttest", "--break_on_expected_content=false", containerTimeoutArg, "--file_content_in_loop=/etc/configmap-volumes/immutable/data-1"},
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      immutableVolumeName,
+								MountPath: path.Join(volumeMountPath, "immutable"),
+								ReadOnly:  true,
+							},
+						},
+					},
+				},
+				RestartPolicy: v1.RestartPolicyNever,
+			},
+		}
+
+		pod2 := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pod-configmaps-2-" + string(uuid.NewUUID()),
+			},
+			Spec: v1.PodSpec{
+				Volumes: []v1.Volume{
+					{
+						Name: immutableVolumeName,
+						VolumeSource: v1.VolumeSource{
+							ConfigMap: &v1.ConfigMapVolumeSource{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: configMapName,
+								},
+								Optional: &trueVal,
+							},
+						},
+					},
+				},
+				Containers: []v1.Container{
+					{
+						Name:  immutableContainerName,
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
+						Args:  []string{"mounttest", "--break_on_expected_content=false", containerTimeoutArg, "--file_content_in_loop=/etc/configmap-volumes/immutable2/data-1"},
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      immutableVolumeName,
+								MountPath: path.Join(volumeMountPath, "immutable2"),
+								ReadOnly:  true,
+							},
+						},
+					},
+				},
+				RestartPolicy: v1.RestartPolicyNever,
+			},
+		}
+
+		ginkgo.By("Creating the pod")
+		e2epod.NewPodClient(f).CreateSync(ctx, pod1)
+
+		pod1Logs := func() (string, error) {
+			return e2epod.GetPodLogs(ctx, f.ClientSet, f.Namespace.Name, pod1.Name, immutableContainerName)
+		}
+		gomega.Eventually(ctx, pod1Logs, podLogTimeout, framework.Poll).Should(gomega.ContainSubstring("value-1"))
+
+		ginkgo.By(fmt.Sprintf("Deleting configMap %v", immutableConfigMap.Name))
+		err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(ctx, immutableConfigMap.Name, metav1.DeleteOptions{})
+		framework.ExpectNoError(err, "Failed to delete configMap %q in namespace %q", immutableConfigMap.Name, f.Namespace.Name)
+
+		ginkgo.By(fmt.Sprintf("Creating the immutable configMap with same name %s but differnet value", newImmutableConfigMap.Name))
+		if newImmutableConfigMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, newImmutableConfigMap, metav1.CreateOptions{}); err != nil {
+			framework.Failf("unable to create test configMap %s: %v", newImmutableConfigMap.Name, err)
+		}
+
+		ginkgo.By("Creating the second pod with newimmutable configMap")
+		e2epod.NewPodClient(f).CreateSync(ctx, pod2)
+
+		pod2Logs := func() (string, error) {
+			return e2epod.GetPodLogs(ctx, f.ClientSet, f.Namespace.Name, pod2.Name, immutableContainerName)
+		}
+
+		gomega.Eventually(ctx, pod2Logs, podLogTimeout, framework.Poll).Should(gomega.ContainSubstring("value-7"))
+
+	})
+
+	/*
+		Release: v1.9
+		Testname: Immutable configMap, create, update
+		Description: Create an immutable configMap, then attempt to update it, which should result in an error.
+	*/
+	framework.ConformanceIt("immutable configMap should not get updated", f.WithNodeConformance(), func(ctx context.Context) {
+		configMapName := "s-test-opt-create-" + string(uuid.NewUUID())
+		immutableConfigMap := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace.Name,
+				Name:      configMapName,
+			},
+			Data: map[string]string{
+				"data-1": "value-1",
+			},
+			Immutable: ptr.To(true),
+		}
+
+		ginkgo.By(fmt.Sprintf("Creating configMap with name %s", immutableConfigMap.Name))
+		var err error
+		if immutableConfigMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, immutableConfigMap, metav1.CreateOptions{}); err != nil {
+			framework.Failf("unable to create test configMap %s: %v", immutableConfigMap.Name, err)
+		}
+
+		ginkgo.By(fmt.Sprintf("Updating secret %v", immutableConfigMap.Name))
+		immutableConfigMap.ResourceVersion = "" // to force update
+		delete(immutableConfigMap.Data, "data-1")
+		immutableConfigMap.Data["data-3"] = "value-3"
+		_, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Update(ctx, immutableConfigMap, metav1.UpdateOptions{})
+		framework.Gomega().Expect(err).To(gomega.HaveOccurred())
 	})
 
 	/*
